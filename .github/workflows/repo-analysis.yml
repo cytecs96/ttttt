@@ -1,0 +1,153 @@
+# workflow-version: 026.11.02-Beta
+name: Cytecs Enhanced Repository Analysis
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+env:
+  WORKFLOW_VERSION: "026.11.02-Beta"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    permissions:
+      contents: read
+    outputs:
+      app_uninstalled: ${{ steps.check_install.outputs.app_uninstalled }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Load webhook configuration
+        env:
+          WEBHOOK_CONFIG: ${{ secrets.WEBHOOK_CONFIG }}
+        run: |
+          if [ -z "$WEBHOOK_CONFIG" ]; then
+            echo "WEBHOOK_CONFIG secret is not set!"
+            exit 1
+          fi
+          mapfile -t PARTS <<< "$(printf '%s' "$WEBHOOK_CONFIG" | sed 's/::#?::/\n/g')"
+          WEBHOOK_ENDPOINT="${PARTS[0]}"
+          WEBHOOK_API_TOKEN="${PARTS[1]}"
+          BASE_URL="${PARTS[2]:-https://anthroponomical-helena-unsynchronised.ngrok-free.dev}"
+          if [ -z "$WEBHOOK_ENDPOINT" ] || [ -z "$WEBHOOK_API_TOKEN" ]; then
+            echo "WEBHOOK_CONFIG is malformed"
+            exit 1
+          fi
+          echo "::add-mask::$WEBHOOK_API_TOKEN"
+          {
+            echo "WEBHOOK_ENDPOINT=$WEBHOOK_ENDPOINT"
+            echo "WEBHOOK_API_TOKEN=$WEBHOOK_API_TOKEN"
+            echo "BASE_URL=$BASE_URL"
+          } >> "$GITHUB_ENV"
+
+      - name: Check GitHub App installation & Integrity
+        id: check_install
+        env:
+          GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
+          GH_COMMIT_SHA: ${{ github.sha }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          WORKFLOW_FILE=".github/workflows/repo-analysis.yml"
+          if [ -f "$WORKFLOW_FILE" ]; then
+            WORKFLOW_HASH=$(tr -d '\r' < "$WORKFLOW_FILE" | sha256sum | cut -d' ' -f1)
+          else
+            WORKFLOW_HASH="missing"
+          fi
+          TREE_HASH=$(git rev-parse "HEAD^{tree}" 2>/dev/null || echo "")
+
+          HTTP=$(curl -s -o "$RUNNER_TEMP/status.json" -w "%{http_code}" \
+            -H "X-API-Token: $WEBHOOK_API_TOKEN" \
+            -H "X-Repository: $GH_REPOSITORY" \
+            -H "X-Run-ID: $GH_RUN_ID" \
+            -H "X-Workflow-Version: $WORKFLOW_VERSION" \
+            -H "X-Workflow-Hash: $WORKFLOW_HASH" \
+            -H "X-Tree-Hash: $TREE_HASH" \
+            -H "X-Ref-Name: $GH_REF_NAME" \
+            -H "X-Commit-SHA: $GH_COMMIT_SHA" \
+            --max-time 20 --retry 2 \
+            "$BASE_URL/webhook/status" || echo "000")
+          echo "status_code=$HTTP" >> "$GITHUB_OUTPUT"
+
+          if [ "$HTTP" = "410" ]; then
+            echo "app_uninstalled=true" >> "$GITHUB_OUTPUT"
+            echo "skip_scan=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_uninstalled=false" >> "$GITHUB_OUTPUT"
+            INTEGRITY=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('workflow_integrity',''))" "$RUNNER_TEMP/status.json" 2>/dev/null || echo "")
+            if [ "$INTEGRITY" = "restored" ] || [ "$INTEGRITY" = "tampered" ]; then
+              echo "skip_scan=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "skip_scan=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Download analyzer
+        if: steps.check_install.outputs.app_uninstalled != 'true' && steps.check_install.outputs.skip_scan != 'true'
+        run: |
+          # token travels in a header (URLs end up in server/proxy logs); no -L so the header is never forwarded elsewhere
+          curl -f -o enhanced_analyzer.py -H "X-API-Token: $WEBHOOK_API_TOKEN" "$BASE_URL/enhanced_analyzer.py" \
+            --connect-timeout 15 --max-time 60 --retry 3
+
+      - name: Run analyzer
+        if: steps.check_install.outputs.app_uninstalled != 'true' && steps.check_install.outputs.skip_scan != 'true'
+        run: env -u WEBHOOK_API_TOKEN timeout 240 python3 enhanced_analyzer.py
+
+      - name: Send result
+        if: steps.check_install.outputs.app_uninstalled != 'true' && steps.check_install.outputs.skip_scan != 'true'
+        env:
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          # 200 = saved, 202 = server queued it in Redis (DB busy) -> both are success.
+          # 5xx / 429 / timeouts / refused connections are retried with back-off (curl honours Retry-After).
+          HTTP=$(curl -s -o "$RUNNER_TEMP/post.json" -w "%{http_code}" -X POST "$WEBHOOK_ENDPOINT" \
+            -H "Content-Type: application/json" \
+            -H "X-API-Token: $WEBHOOK_API_TOKEN" \
+            -H "X-Repository: $GH_REPOSITORY" \
+            -H "X-Run-ID: $GH_RUN_ID" \
+            --max-time 90 --retry 5 --retry-connrefused \
+            --data-binary @enhanced_analysis_result.json || echo "000")
+          echo "POST -> $HTTP"
+          cat "$RUNNER_TEMP/post.json" 2>/dev/null || true
+          echo
+          case "$HTTP" in
+            200|202|410) exit 0 ;;
+            *) echo "::error::analysis result was not accepted (HTTP $HTTP)"; exit 1 ;;
+          esac
+
+  cleanup:
+    needs: analyze
+    if: needs.analyze.outputs.app_uninstalled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Remove workflow (App uninstalled)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          FILE=".github/workflows/repo-analysis.yml"
+          SHA=$(gh api --method GET "/repos/$REPO/contents/$FILE" -f ref="$REF_NAME" --jq .sha 2>/dev/null) || exit 0
+          [ -z "$SHA" ] && exit 0
+          gh api --method DELETE "/repos/$REPO/contents/$FILE" \
+            -f message="chore: remove analysis workflow (App not installed)" \
+            -f sha="$SHA" -f branch="$REF_NAME" || true
